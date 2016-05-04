@@ -5,6 +5,7 @@ Webtask/webhook to update internal modules dependencies when a new version of on
 ## webtask configuration
 
 * Add 2 secrets to your webtask `GITHUB_USER` and `GITHUB_API_KEY`:
+
   ```
   wt create index.js \
     --bundle \
