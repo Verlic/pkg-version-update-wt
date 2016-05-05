@@ -1,5 +1,7 @@
+import request from 'request'
+import fs from 'fs'
+import cp from 'child_process';
 import {parallel, series, waterfall} from 'async';
-import request from 'request';
 import semver from 'semver';
 import {sprintf} from 'sprintf-js';
 import {github} from './github';
@@ -51,7 +53,12 @@ function getInputs(conf) {
     parallel({
       repos: cb => github.get(`orgs/${ORG}/repos`, transform(cb)),
       package: cb => github.get(`${REPO_BASE}/contents/package.json`, transform(cb)),
-      shrinkwrap: cb => github.get(`${REPO_BASE}/contents/npm-shrinkwrap.json`, transform(cb)),
+      shrinkwrap: cb => {
+        github.get(`${REPO_BASE}/contents/npm-shrinkwrap.json`, transform((err, data) => {
+          /* Ignore the error where there is no shrinkwrap file - we support that case */
+          cb(null, data)
+        }))
+      },
       refs: cb => github.get(`${REPO_BASE}/git/refs`, transform(cb))
     }, cb);
   };
@@ -91,22 +98,23 @@ function updateFiles(conf) {
     }, (err, res) => {
       if (err) return cb(null, err);
       // Assumes we always have both files all the way down.
-
       let pkg_update = updatePackageFileContent(res.package, REPO_NAME, RELEASE);
-      let swk_update = updateShrinkwrapFileContent(conf, res.shrinkwrap, REPO_NAME, RELEASE);
+      updateShrinkwrapFileContent(conf, res.shrinkwrap, REPO_NAME, RELEASE,
+        pkg_update.package, pkg_update.updated, function(err, swk_update){
+        if (err) return cb(err)
+        let data = {
+          repo,
+          repo_url: REPO_BASE,
+          package: pkg_update.updated ? pkg_update.package: res.package,
+          shrinkwrap: swk_update.updated ? swk_update.shrinkwrap : res.shrinkwrap,
+          updated_pkg: pkg_update.updated,
+          message_pkg: pkg_update.message,
+          updated_swk: swk_update.updated,
+          message_swk: swk_update.message
+        };
 
-      let data = {
-        repo,
-        repo_url: REPO_BASE,
-        package: pkg_update.updated ? pkg_update.package: res.package,
-        shrinkwrap: swk_update.updated ? swk_update.shrinkwrap : res.shrinkwrap,
-        updated_pkg: pkg_update.updated,
-        message_pkg: pkg_update.message,
-        updated_swk: swk_update.updated,
-        message_swk: swk_update.message
-      };
-
-      cb(null, data);
+        cb(null, data);
+      });
     });
   };
 }
@@ -235,33 +243,42 @@ function updatePackageFileContent(file, depName, version) {
 }
 
 // Update npm-shrinkwrap.json file.
-function updateShrinkwrapFileContent(conf, file, depName, version) {
-  let updated = false;
-
-  if (file) {
-    const SHA = conf.inputs.refs.filter(ref => ref['ref'] === `refs/tags/${version}`)[0].object.sha;
-    let swk = readJSONFileContent(file);
-    let dep = swk.dependencies ? swk.dependencies[depName] : null;
-    let dep_src = readJSONFileContent(conf.inputs.shrinkwrap).dependencies;
-    let regexp_version = /(\d\.\d\.\d)$/;
-    let regexp_sha = /#(.*)$/;
-
-    if (dep && semver.gt(version, dep.version)) {
-      let _sha = regexp_sha.exec(dep.resolved)[1];
-      dep.version = version;
-      dep.from = dep.from.replace(regexp_version, version);
-      dep.resolved = dep.resolved.replace(_sha, SHA);
-      dep.dependencies = dep_src;
-      writeJSONFileContent(file, swk);
-      updated = true;
-    }
+function updateShrinkwrapFileContent(conf, file, depName, version, package_file, updated, cb) {
+  function finished(wasUpdated){
+    cb(null, {
+       shrinkwrap: file,
+       message: wasUpdated ? 'Updated npm-shrinkwrap.json': null,
+       updated: wasUpdated
+    })
   }
 
-  return {
-    shrinkwrap: file,
-    message: updated ? 'Updated npm-shrinkwrap.json': null,
-    updated
-  };
+  if (file && updated) {
+    var url = 'http://shrinkwrap.adamdangoor.com/v1/shrinkwrap'
+    request({
+      method: 'POST',
+      url: url,
+      headers: {
+        'Content-type': 'application/json'
+      },
+      json: true,
+      body: {
+        package_file: package_file.content,
+        github_ssh_key: conf.GITHUB_SSH_KEY
+      }
+    }, function(err, res) {
+      if (err) {
+        return cb(err)
+      }
+      if (res.statusCode != 200) {
+        return cb(res.body)
+      }
+
+      writeJSONFileContent(file, res.body)
+      finished(true)
+    })
+  } else {
+    finished(false)
+  }
 }
 
 
